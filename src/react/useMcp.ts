@@ -20,6 +20,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { auth, UnauthorizedError, OAuthClientProvider } from '@modelcontextprotocol/sdk/client/auth.js'
 import { sanitizeUrl } from 'strict-url-sanitise'
 import { BrowserOAuthClientProvider } from '../auth/browser-provider.js' // Adjust path
+import { AuthResult } from '../auth/types.js' // Add AuthResult type
 import { assert } from '../utils/assert.js' // Adjust path
 import type { UseMcpOptions, UseMcpResult } from './types.js' // Adjust path
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js' // Added for type safety
@@ -27,6 +28,8 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js' /
 const DEFAULT_RECONNECT_DELAY = 3000
 const DEFAULT_RETRY_DELAY = 5000
 const AUTH_TIMEOUT = 5 * 60 * 1000
+const AUTH_POLLING_INTERVAL = 500
+const MAX_POLLING_DURATION = 10 * 60 * 1000 // 10 minutes max polling
 
 // Define Transport types literal for clarity
 type TransportType = 'http' | 'sse'
@@ -67,6 +70,8 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
   const isMountedRef = useRef<boolean>(true)
   const connectAttemptRef = useRef<number>(0)
   const authTimeoutRef = useRef<number | null>(null)
+  const authPollingRef = useRef<number | null>(null)
+  const currentAuthSessionRef = useRef<string | null>(null)
 
   // --- Refs for values used in callbacks ---
   const stateRef = useRef(state)
@@ -95,6 +100,37 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
     [], // Empty dependency array makes this stable
   )
 
+  // Helper function to clean up expired auth sessions from localStorage
+  const cleanupExpiredAuthSessions = useCallback(() => {
+    const now = Date.now()
+    const keysToRemove: string[] = []
+
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (!key || !key.startsWith(`${storageKeyPrefix}:auth_result_`)) continue
+
+      try {
+        const item = localStorage.getItem(key)
+        if (!item) continue
+
+        const authResult = JSON.parse(item) as AuthResult
+        if (authResult.expiry && authResult.expiry < now) {
+          keysToRemove.push(key)
+        }
+      } catch (e) {
+        // Remove malformed items
+        keysToRemove.push(key)
+      }
+    }
+
+    keysToRemove.forEach((key) => {
+      localStorage.removeItem(key)
+      addLog('debug', `Cleaned up expired auth session: ${key}`)
+    })
+
+    return keysToRemove.length
+  }, [storageKeyPrefix, addLog])
+
   // disconnect is stable (depends only on stable addLog)
   const disconnect = useCallback(
     async (quiet = false) => {
@@ -102,6 +138,9 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
       connectingRef.current = false
       if (authTimeoutRef.current) clearTimeout(authTimeoutRef.current)
       authTimeoutRef.current = null
+      if (authPollingRef.current) clearInterval(authPollingRef.current)
+      authPollingRef.current = null
+      currentAuthSessionRef.current = null
 
       const transport = transportRef.current
       clientRef.current = null // Ensure client is cleared
@@ -399,7 +438,11 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
             setState('authenticating')
             if (authTimeoutRef.current) clearTimeout(authTimeoutRef.current)
             authTimeoutRef.current = setTimeout(() => {
-              /* ... timeout logic ... */
+              if (isMountedRef.current && stateRef.current === 'authenticating') {
+                addLog('warn', 'Authentication timed out after 5 minutes')
+                stopAuthPolling()
+                failConnection('Authentication timed out. Please try again.')
+              }
             }, AUTH_TIMEOUT)
           }
 
@@ -420,6 +463,12 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
               return 'failed' // Stop this attempt sequence, new one started
             } else if (authResult === 'REDIRECT') {
               addLog('info', 'Redirecting for authentication. Waiting for callback...')
+              // Start auth polling for the current session
+              const authSessionId = authProviderRef.current?.getCurrentAuthSessionId()
+              if (authSessionId) {
+                currentAuthSessionRef.current = authSessionId
+                startAuthPolling(authSessionId)
+              }
               return 'auth_redirect' // Signal that we are waiting for redirect
             }
           } catch (sdkAuthError) {
@@ -528,7 +577,11 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
           setState('authenticating') // Update UI state
           if (authTimeoutRef.current) clearTimeout(authTimeoutRef.current) // Reset timeout
           authTimeoutRef.current = setTimeout(() => {
-            /* ... timeout logic ... */
+            if (isMountedRef.current && stateRef.current === 'authenticating') {
+              addLog('warn', 'Re-authentication timed out after 5 minutes')
+              stopAuthPolling()
+              failConnection('Re-authentication timed out. Please try again.')
+            }
           }, AUTH_TIMEOUT)
 
           try {
@@ -547,6 +600,12 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
               connect() // Reconnect session
             } else if (authResult === 'REDIRECT') {
               addLog('info', 'Redirecting for re-authentication for tool call.')
+              // Start auth polling for the current session
+              const authSessionId = authProviderRef.current?.getCurrentAuthSessionId()
+              if (authSessionId) {
+                currentAuthSessionRef.current = authSessionId
+                startAuthPolling(authSessionId)
+              }
               // State is authenticating, wait for callback
             }
           } catch (sdkAuthError) {
@@ -597,7 +656,11 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
       setState('authenticating')
       if (authTimeoutRef.current) clearTimeout(authTimeoutRef.current)
       authTimeoutRef.current = setTimeout(() => {
-        /* ... timeout logic ... */
+        if (isMountedRef.current && stateRef.current === 'authenticating') {
+          addLog('warn', 'Manual authentication timed out after 5 minutes')
+          stopAuthPolling()
+          failConnection('Manual authentication timed out. Please try again.')
+        }
       }, AUTH_TIMEOUT)
 
       try {
@@ -613,6 +676,12 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
           connect() // Restart full connection sequence
         } else if (authResult === 'REDIRECT') {
           addLog('info', 'Redirecting for manual authentication. Waiting for callback...')
+          // Start auth polling for the current session
+          const authSessionId = authProviderRef.current?.getCurrentAuthSessionId()
+          if (authSessionId) {
+            currentAuthSessionRef.current = authSessionId
+            startAuthPolling(authSessionId)
+          }
           // State is already authenticating, wait for callback
         }
       } catch (authError) {
@@ -648,14 +717,22 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
   const clearStorage = useCallback(() => {
     if (authProviderRef.current) {
       const count = authProviderRef.current.clearStorage()
-      addLog('info', `Cleared ${count} item(s) from localStorage for ${url}.`)
+      // Also clean up any auth result sessions
+      const cleanedAuthSessions = cleanupExpiredAuthSessions()
+      addLog('info', `Cleared ${count} provider item(s) and ${cleanedAuthSessions} auth session(s) from localStorage for ${url}.`)
+      // Stop any ongoing auth polling
+      if (authPollingRef.current) {
+        clearInterval(authPollingRef.current)
+        authPollingRef.current = null
+      }
+      currentAuthSessionRef.current = null
       setAuthUrl(undefined) // Clear manual URL state
       // Disconnect should reset state appropriately
       disconnect()
     } else {
       addLog('warn', 'Auth provider not initialized, cannot clear storage.')
     }
-  }, [url, addLog, disconnect]) // Depends on url and stable callbacks
+  }, [url, addLog, disconnect, cleanupExpiredAuthSessions]) // Depends on url and stable callbacks
 
   // listResources is stable (depends on stable addLog)
   const listResources = useCallback(async () => {
@@ -739,34 +816,138 @@ export function useMcp(options: UseMcpOptions): UseMcpResult {
     [state, addLog],
   ) // Depends on state for error message and stable addLog
 
+  // Helper function to start auth polling (defined after main callbacks)
+  const startAuthPolling = useCallback(
+    (sessionId: string) => {
+      // Validate session ID
+      if (!sessionId || typeof sessionId !== 'string' || sessionId.trim() === '') {
+        addLog('error', 'Cannot start auth polling: invalid session ID')
+        return
+      }
+
+      // Stop any existing polling
+      if (authPollingRef.current) {
+        clearInterval(authPollingRef.current)
+        authPollingRef.current = null
+      }
+
+      const authResultKey = `${storageKeyPrefix}:auth_result_${sessionId}`
+      const pollingStartTime = Date.now()
+      addLog('debug', `Starting auth polling for session: ${sessionId}`)
+
+      authPollingRef.current = setInterval(() => {
+        if (!isMountedRef.current) {
+          if (authPollingRef.current) {
+            clearInterval(authPollingRef.current)
+            authPollingRef.current = null
+          }
+          return
+        }
+
+        // Safety: Stop polling after maximum duration
+        if (Date.now() - pollingStartTime > MAX_POLLING_DURATION) {
+          addLog('warn', `Auth polling exceeded maximum duration (${MAX_POLLING_DURATION}ms), stopping`)
+          if (authPollingRef.current) {
+            clearInterval(authPollingRef.current)
+            authPollingRef.current = null
+          }
+          currentAuthSessionRef.current = null
+          failConnection('Authentication polling timed out after 10 minutes')
+          return
+        }
+
+        try {
+          const authResultJSON = localStorage.getItem(authResultKey)
+          if (!authResultJSON) return // Still waiting
+
+          addLog('debug', `Auth result found for session ${sessionId}`)
+          let authResult
+          try {
+            authResult = JSON.parse(authResultJSON)
+          } catch (parseError) {
+            addLog('error', 'Failed to parse auth result, cleaning up malformed entry')
+            localStorage.removeItem(authResultKey)
+            return // Continue polling, this was likely corruption
+          }
+
+          // Validate auth result structure
+          if (typeof authResult !== 'object' || authResult === null || typeof authResult.success !== 'boolean') {
+            addLog('error', 'Invalid auth result structure, cleaning up')
+            localStorage.removeItem(authResultKey)
+            return // Continue polling
+          }
+
+          // Type assertion after validation
+          const typedResult = authResult as AuthResult
+
+          // Check if result has expired
+          if (typedResult.expiry && typedResult.expiry < Date.now()) {
+            addLog('debug', 'Auth result expired, cleaning up')
+            localStorage.removeItem(authResultKey)
+            return // Continue polling
+          }
+
+          // Stop polling
+          if (authPollingRef.current) {
+            clearInterval(authPollingRef.current)
+            authPollingRef.current = null
+          }
+
+          // Clear timeout
+          if (authTimeoutRef.current) {
+            clearTimeout(authTimeoutRef.current)
+            authTimeoutRef.current = null
+          }
+
+          // Clean up the auth result from storage
+          localStorage.removeItem(authResultKey)
+          currentAuthSessionRef.current = null
+
+          // Handle the result
+          if (typedResult.success) {
+            addLog('info', 'Authentication successful via localStorage polling. Reconnecting client...')
+            connectingRef.current = false
+            connect()
+          } else {
+            failConnection(`Authentication failed: ${typedResult.error || 'Unknown reason.'}`)
+          }
+        } catch (e) {
+          addLog('warn', 'Error parsing auth result from localStorage:', e)
+          // Continue polling in case it was a temporary parsing issue
+        }
+      }, AUTH_POLLING_INTERVAL)
+    },
+    [storageKeyPrefix, addLog, connect, failConnection],
+  )
+
+  // Helper function to stop auth polling
+  const stopAuthPolling = useCallback(() => {
+    if (authPollingRef.current) {
+      clearInterval(authPollingRef.current)
+      authPollingRef.current = null
+      addLog('debug', 'Auth polling stopped')
+    }
+    currentAuthSessionRef.current = null
+  }, [addLog])
+
   // ===== Effects =====
 
-  // Effect for handling auth callback messages from popup (Stable dependencies)
+  // Effect for cleaning up expired auth sessions and initializing
   useEffect(() => {
-    const messageHandler = (event: MessageEvent) => {
-      if (event.origin !== window.location.origin) return
-      if (event.data?.type === 'mcp_auth_callback') {
-        addLog('info', 'Received auth callback message.', event.data)
-        if (authTimeoutRef.current) clearTimeout(authTimeoutRef.current)
-
-        if (event.data.success) {
-          addLog('info', 'Authentication successful via popup. Reconnecting client...')
-          connectingRef.current = false
-          connect() // Call stable connect
-        } else {
-          failConnection(`Authentication failed in callback: ${event.data.error || 'Unknown reason.'}`) // Call stable failConnection
-        }
-      }
+    // Clean up expired auth sessions on mount
+    const cleanedCount = cleanupExpiredAuthSessions()
+    if (cleanedCount > 0) {
+      addLog('debug', `Cleaned up ${cleanedCount} expired auth sessions on mount`)
     }
-    window.addEventListener('message', messageHandler)
-    addLog('debug', 'Auth callback message listener added.')
+
+    // Cleanup on unmount
     return () => {
-      window.removeEventListener('message', messageHandler)
-      addLog('debug', 'Auth callback message listener removed.')
       if (authTimeoutRef.current) clearTimeout(authTimeoutRef.current)
+      if (authPollingRef.current) clearInterval(authPollingRef.current)
+      addLog('debug', 'Auth resources cleaned up on unmount')
     }
     // Dependencies are stable callbacks
-  }, [addLog, failConnection, connect])
+  }, [addLog, cleanupExpiredAuthSessions])
 
   // Initial Connection (depends on config and stable callbacks)
   useEffect(() => {

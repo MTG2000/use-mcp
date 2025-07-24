@@ -130,10 +130,14 @@ export class BrowserOAuthClientProvider implements OAuthClientProvider {
     const state = crypto.randomUUID()
     const stateKey = `${this.storageKeyPrefix}:state_${state}`
 
+    // Generate a unique session ID for auth polling
+    const authSessionId = crypto.randomUUID()
+
     // Store context needed by the callback handler, associated with the state param
     const stateData: StoredState = {
       serverUrlHash: this.serverUrlHash,
       expiry: Date.now() + 1000 * 60 * 10, // State expires in 10 minutes
+      authSessionId, // Add session ID for polling
       // Store provider options needed to reconstruct on callback
       providerOptions: {
         serverUrl: this.serverUrl,
@@ -155,7 +159,17 @@ export class BrowserOAuthClientProvider implements OAuthClientProvider {
     // Persist the exact auth URL in case the popup fails and manual navigation is needed
     localStorage.setItem(this.getKey('last_auth_url'), sanitizedAuthUrl)
 
+    // Store the session ID for the auth attempt
+    localStorage.setItem(this.getKey('current_auth_session'), authSessionId)
+
     return sanitizedAuthUrl
+  }
+
+  /**
+   * Gets the current auth session ID if one exists
+   */
+  getCurrentAuthSessionId(): string | null {
+    return localStorage.getItem(this.getKey('current_auth_session'))
   }
 
   /**
@@ -208,6 +222,7 @@ export class BrowserOAuthClientProvider implements OAuthClientProvider {
   clearStorage(): number {
     const prefixPattern = `${this.storageKeyPrefix}_${this.serverUrlHash}_`
     const statePattern = `${this.storageKeyPrefix}:state_`
+    const authResultPattern = `${this.storageKeyPrefix}:auth_result_`
     const keysToRemove: string[] = []
     let count = 0
 
@@ -233,6 +248,10 @@ export class BrowserOAuthClientProvider implements OAuthClientProvider {
           // Optionally remove malformed keys
           // keysToRemove.push(key);
         }
+      } else if (key.startsWith(authResultPattern)) {
+        // Clean up all auth result entries for this storage prefix
+        // We can't easily scope them to specific servers, so clean all
+        keysToRemove.push(key)
       }
     }
 

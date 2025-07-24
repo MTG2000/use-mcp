@@ -1,7 +1,7 @@
 // callback.ts
 import { auth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { BrowserOAuthClientProvider } from './browser-provider.js' // Adjust path
-import { StoredState } from './types.js' // Adjust path, ensure definition includes providerOptions
+import { StoredState, AuthResult } from './types.js' // Adjust path, ensure definition includes providerOptions
 
 /**
  * Handles the OAuth callback using the SDK's auth() function.
@@ -70,16 +70,38 @@ export async function onMcpAuthorization() {
     const authResult = await auth(provider, { serverUrl, authorizationCode: code })
 
     if (authResult === 'AUTHORIZED') {
-      console.log(`${logPrefix} Authorization successful via SDK auth(). Notifying opener...`)
-      // --- Notify Opener and Close (Success) ---
-      if (window.opener && !window.opener.closed) {
-        window.opener.postMessage({ type: 'mcp_auth_callback', success: true }, window.location.origin)
-        window.close()
+      console.log(`${logPrefix} Authorization successful via SDK auth(). Writing result to localStorage...`)
+
+      // Write success result to localStorage for polling
+      if (storedStateData.authSessionId) {
+        const authResultKey = `${storedStateData.providerOptions.storageKeyPrefix}:auth_result_${storedStateData.authSessionId}`
+        const authResultData: AuthResult = {
+          success: true,
+          timestamp: Date.now(),
+          expiry: Date.now() + 1000 * 60 * 5, // Result expires in 5 minutes
+        }
+        localStorage.setItem(authResultKey, JSON.stringify(authResultData))
+        console.log(`${logPrefix} Auth result written to localStorage: ${authResultKey}`)
       } else {
-        console.warn(`${logPrefix} No opener window detected. Redirecting to root.`)
-        window.location.href = '/' // Or a configured post-auth destination
+        console.warn(`${logPrefix} No authSessionId found in stored state, cannot write to localStorage for polling`)
       }
-      // Clean up state ONLY on success and after notifying opener
+
+      // Try postMessage as fallback (for compatibility if window.opener exists)
+      if (window.opener && !window.opener.closed) {
+        try {
+          window.opener.postMessage({ type: 'mcp_auth_callback', success: true }, window.location.origin)
+          console.log(`${logPrefix} Also sent postMessage to opener as fallback`)
+        } catch (e) {
+          console.log(`${logPrefix} PostMessage fallback failed (expected if opener is nullified):`, e)
+        }
+      }
+
+      // Close the popup after a short delay to ensure localStorage write completes
+      setTimeout(() => {
+        window.close()
+      }, 100)
+
+      // Clean up state ONLY on success and after writing result
       localStorage.removeItem(stateKey)
     } else {
       // This case shouldn't happen if `authorizationCode` is provided to `auth()`
@@ -90,11 +112,29 @@ export async function onMcpAuthorization() {
     console.error(`${logPrefix} Error during OAuth callback handling:`, err)
     const errorMessage = err instanceof Error ? err.message : String(err)
 
-    // --- Notify Opener and Display Error (Failure) ---
+    // Write error result to localStorage for polling
+    if (storedStateData?.authSessionId) {
+      const authResultKey = `${storedStateData.providerOptions.storageKeyPrefix}:auth_result_${storedStateData.authSessionId}`
+      const authResultData: AuthResult = {
+        success: false,
+        error: errorMessage,
+        timestamp: Date.now(),
+        expiry: Date.now() + 1000 * 60 * 5, // Result expires in 5 minutes
+      }
+      localStorage.setItem(authResultKey, JSON.stringify(authResultData))
+      console.log(`${logPrefix} Auth error written to localStorage: ${authResultKey}`)
+    } else {
+      console.warn(`${logPrefix} No authSessionId found in stored state, cannot write error to localStorage for polling`)
+    }
+
+    // Try postMessage as fallback (for compatibility)
     if (window.opener && !window.opener.closed) {
-      window.opener.postMessage({ type: 'mcp_auth_callback', success: false, error: errorMessage }, window.location.origin)
-      // Optionally close even on error, depending on UX preference
-      // window.close();
+      try {
+        window.opener.postMessage({ type: 'mcp_auth_callback', success: false, error: errorMessage }, window.location.origin)
+        console.log(`${logPrefix} Also sent error postMessage to opener as fallback`)
+      } catch (e) {
+        console.log(`${logPrefix} PostMessage fallback failed (expected if opener is nullified):`, e)
+      }
     }
 
     // Display error in the callback window

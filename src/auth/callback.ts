@@ -86,16 +86,6 @@ export async function onMcpAuthorization() {
         console.warn(`${logPrefix} No authSessionId found in stored state, cannot write to localStorage for polling`)
       }
 
-      // Try postMessage as fallback (for compatibility if window.opener exists)
-      if (window.opener && !window.opener.closed) {
-        try {
-          window.opener.postMessage({ type: 'mcp_auth_callback', success: true }, window.location.origin)
-          console.log(`${logPrefix} Also sent postMessage to opener as fallback`)
-        } catch (e) {
-          console.log(`${logPrefix} PostMessage fallback failed (expected if opener is nullified):`, e)
-        }
-      }
-
       // Close the popup after a short delay to ensure localStorage write completes
       setTimeout(() => {
         window.close()
@@ -125,16 +115,6 @@ export async function onMcpAuthorization() {
       console.log(`${logPrefix} Auth error written to localStorage: ${authResultKey}`)
     } else {
       console.warn(`${logPrefix} No authSessionId found in stored state, cannot write error to localStorage for polling`)
-    }
-
-    // Try postMessage as fallback (for compatibility)
-    if (window.opener && !window.opener.closed) {
-      try {
-        window.opener.postMessage({ type: 'mcp_auth_callback', success: false, error: errorMessage }, window.location.origin)
-        console.log(`${logPrefix} Also sent error postMessage to opener as fallback`)
-      } catch (e) {
-        console.log(`${logPrefix} PostMessage fallback failed (expected if opener is nullified):`, e)
-      }
     }
 
     // Display error in the callback window
